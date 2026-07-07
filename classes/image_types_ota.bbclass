@@ -24,7 +24,13 @@ IMAGE_CMD:ota () {
 		mkdir -p ${OTA_SYSROOT}/boot/grub2
 		ln -s ../loader/grub.cfg ${OTA_SYSROOT}/boot/grub2/grub.cfg
 	elif [ "${OSTREE_BOOTLOADER}" = "systemd-boot" ]; then
-		touch ${OTA_SYSROOT}/boot/loader/loader.conf
+		# For type-2 UKI publishing, pin the boot loader default to the ostree
+		# family so a stray higher-sorting .efi cannot become the default.
+		if [ "${@oe.utils.conditional('OSTREE_SEALED_UKI', '1', '1', '0', d)}" = "1" ]; then
+			printf 'default ostree-*\n' > ${OTA_SYSROOT}/boot/loader/loader.conf
+		else
+			touch ${OTA_SYSROOT}/boot/loader/loader.conf
+		fi
 	elif [ "${OSTREE_BOOTLOADER}" = "u-boot" ]; then
 		touch ${OTA_SYSROOT}/boot/loader/uEnv.txt
 	elif [ "${OSTREE_BOOTLOADER}" = "syslinux" ]; then

@@ -77,6 +77,11 @@ OSTREE_MULTI_DEVICETREE_SUPPORT ??= "0"
 OSTREE_SYSROOT_READONLY ??= "0"
 OSTREE_REPO_CONFIG ?= ""
 OSTREE_OTA_REPO_CONFIG ?= ""
+# When sealing is enabled, publish the UKIs as systemd-boot type-2 entries under
+# EFI/Linux (see the sealed UKI ostree patch); boot order and rollback are then
+# driven by the .efi file names rather than a type-1 loader entry per deployment.
+OSTREE_REPO_CONFIG:append = "${@oe.utils.conditional('OSTREE_SEALED_UKI', '1', ' sysroot.sd-boot-type2:true', '', d)}"
+OSTREE_OTA_REPO_CONFIG:append = "${@oe.utils.conditional('OSTREE_SEALED_UKI', '1', ' sysroot.sd-boot-type2:true', '', d)}"
 OSTREE_EFI_SIZE ?= "524288"
 OSTREE_WKS_EFI_SIZE ?= "--size ${OSTREE_EFI_SIZE}K"
 
