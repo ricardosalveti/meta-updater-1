@@ -7,9 +7,11 @@ IMAGE_CLASSES += "image_types_qcom"
 IMAGE_FSTYPES += "ota-esp qcomflash"
 IMAGE_TYPEDEP:qcomflash += "ota-ext4 ota-esp"
 
-# Handled by ostree
-UKI_CMDLINE = ""
 OSTREE_KERNEL_ARGS ?= "console=ttyMSM0,115200 ${OSTREE_KERNEL_ARGS_COMMON} ${KERNEL_CMDLINE_EXTRA}"
+
+# Seal the kernel command line inside the UKI; mechanism in sota.bbclass
+OSTREE_SEALED_UKI ?= "1"
+OSTREE_SEALED_UKI:qcom-armv7a = "0"
 
 # No custom esp image required
 QCOM_ESP_IMAGE = ""
