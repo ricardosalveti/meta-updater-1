@@ -1,0 +1,1070 @@
+From e0a31d495fefcea597d35308456d1767863ff4fe Mon Sep 17 00:00:00 2001
+From: Ricardo Salveti <ricardo.salveti@oss.qualcomm.com>
+Date: Tue, 7 Jul 2026 01:09:46 +0000
+Subject: [PATCH] deploy: add sealed UKI support
+
+Support booting an ostree deployment from a Unified Kernel Image whose
+kernel command line is embedded (and typically signed for UEFI Secure
+Boot) in its .cmdline PE section, and publishing those UKIs as Boot
+Loader Specification type-2 entries.
+
+A sealed UKI cannot carry the mutable ostree=/ostree/boot.BOOTVERSION/...
+bootlink argument (bootversion and bootserial are assigned at deploy
+time), so it embeds a fixed selector argument instead:
+
+    ostree=/ostree/root.BOOTID
+
+where BOOTID is chosen when the UKI is built and shipped in the
+deployment tree as usr/lib/modules/KVER/ostree-boot-id next to uki.efi.
+ostree-prepare-root already resolves any symlink target of the ostree=
+argument, so no boot-side change is needed.
+
+At deploy time, for a UKI deployment that ships an ostree-boot-id:
+
+- maintain the /ostree/root.BOOTID symlink pointing at the deployment
+  directory (same shape as the aboot slot links);
+- write the loader entry without an options line so systemd-boot passes
+  no load options and systemd-stub uses the embedded command line
+  regardless of Secure Boot state; record the bootlink in an
+  x-ostree-bootlink vendor key so deployments stay enumerable;
+- garbage-collect dangling /ostree/root.* selector symlinks.
+
+The system generator resolves the stateroot through the selector symlink
+(like aboot), the soft-reboot karg comparison tolerates deployments
+without bootconfig kargs, and ostree_bootconfig_parser_set() learns to
+remove a key when passed NULL.
+
+When sysroot.sd-boot-type2 is additionally set, the sealed UKIs are
+published into EFI/Linux/ostree-INDEX-BOOTID[+TRIES].efi so systemd-boot
+auto-discovers them as type-2 entries ordered by file name; no type-1
+entries are written for the boot loader to read, and ostree keeps its
+bookkeeping fragments in loader/entries.ostree (which the boot loader
+does not scan) with a read-path fallback to the classic entries
+directory for pre-migration deployments. The UKIs are published from the
+systemd-boot backend: write_config builds and validates a publish plan
+before the boot-directory swap (so errors leave the running system
+untouched) and post_bls_sync executes it afterwards, installing fresh
+UKIs and renaming existing ones for index changes while preserving the
+live boot-counter suffix. Stale and orphaned EFI/Linux UKIs are reaped
+in the boot filesystem cleanup, and loader.conf gets a "default ostree-*"
+line so a stray higher-sorting .efi cannot become the default.
+
+Upstream-Status: Pending
+Signed-off-by: Ricardo Salveti <ricardo.salveti@oss.qualcomm.com>
+---
+ man/ostree.repo-config.xml                   |  18 ++
+ src/libostree/ostree-bootconfig-parser.c     |   7 +-
+ src/libostree/ostree-bootloader-sd-boot.c    | 299 +++++++++++++++++++
+ src/libostree/ostree-impl-system-generator.c |  10 +-
+ src/libostree/ostree-repo-private.h          |   1 +
+ src/libostree/ostree-repo.c                  |   4 +
+ src/libostree/ostree-sysroot-cleanup.c       | 141 +++++++++
+ src/libostree/ostree-sysroot-deploy.c        | 166 ++++++++--
+ src/libostree/ostree-sysroot-private.h       |  10 +
+ src/libostree/ostree-sysroot.c               |  37 ++-
+ 10 files changed, 656 insertions(+), 37 deletions(-)
+
+diff --git a/man/ostree.repo-config.xml b/man/ostree.repo-config.xml
+index a9cc75bd..f5a9c52f 100644
+--- a/man/ostree.repo-config.xml
++++ b/man/ostree.repo-config.xml
+@@ -420,6 +420,24 @@ License along with this library. If not, see <https://www.gnu.org/licenses/>.
+         </para></listitem>
+       </varlistentry>
+ 
++      <varlistentry>
++        <term><varname>sd-boot-type2</varname></term>
++        <listitem><para>A boolean value; defaults to false. When set to true and the
++        <literal>bootloader</literal> is <literal>systemd-boot</literal>, sealed Unified Kernel
++        Images (UKIs carrying an embedded kernel command line with a fixed
++        <literal>ostree=/ostree/root.BOOTID</literal> selector, marked by an
++        <literal>ostree-boot-id</literal> file in the deployment tree) are published as
++        boot loader specification type-2 entries under <literal>EFI/Linux</literal> on the ESP,
++        named <literal>ostree-INDEX-BOOTID[+TRIES].efi</literal>. The boot loader discovers and
++        orders them by file name, so no <literal>options</literal>-bearing type-1 entries are
++        written; ostree keeps its own bookkeeping fragments in
++        <literal>loader/entries.ostree</literal>, which the boot loader does not scan. Every
++        deployment must be a sealed UKI in this mode. More details on the entry types in the
++        <ulink url="https://uapi-group.org/specifications/specs/boot_loader_specification/">
++        The Boot Loader Specification</ulink>.
++        </para></listitem>
++      </varlistentry>
++
+       <varlistentry>
+         <term><varname>bls-append-except-default</varname></term>
+         <listitem><para>A semicolon separated string list of key-value pairs. For example:
+diff --git a/src/libostree/ostree-bootconfig-parser.c b/src/libostree/ostree-bootconfig-parser.c
+index 4e7c823a..125fa59c 100644
+--- a/src/libostree/ostree-bootconfig-parser.c
++++ b/src/libostree/ostree-bootconfig-parser.c
+@@ -215,13 +215,18 @@ ostree_bootconfig_parser_parse (OstreeBootconfigParser *self, GFile *path,
+  * ostree_bootconfig_parser_set:
+  * @self: Parser
+  * @key: the key
+- * @value: the key
++ * @value: (nullable): the value, or %NULL to remove the key
+  *
+  * Set the @key/@value pair to the boot configuration dictionary.
+  */
+ void
+ ostree_bootconfig_parser_set (OstreeBootconfigParser *self, const char *key, const char *value)
+ {
++  if (value == NULL)
++    {
++      g_hash_table_remove (self->options, key);
++      return;
++    }
+   g_hash_table_replace (self->options, g_strdup (key), g_strdup (value));
+ }
+ 
+diff --git a/src/libostree/ostree-bootloader-sd-boot.c b/src/libostree/ostree-bootloader-sd-boot.c
+index d7fa7d16..0b7438ef 100644
+--- a/src/libostree/ostree-bootloader-sd-boot.c
++++ b/src/libostree/ostree-bootloader-sd-boot.c
+@@ -22,19 +22,47 @@
+ 
+ #include "config.h"
+ 
++#include "ostree-bootconfig-parser-private.h"
++#include "ostree-repo-private.h"
+ #include "ostree-sysroot-private.h"
+ #include "ostree-bootloader-sd-boot.h"
+ #include "otutil.h"
+ 
++#include <inttypes.h>
+ #include <string.h>
+ 
+ static const char sdboot_config_path[] = "boot/loader/loader.conf";
++/* systemd-boot auto-discovers type-2 entries (UKIs) from this directory on the ESP.
++ * Relative to the boot fd (i.e. the ESP root), not the sysroot fd. */
++static const char sdboot_uki_dir[] = "EFI/Linux";
++static const char sdboot_default_line[] = "default ostree-*";
++
++/* One UKI to publish into EFI/Linux; built in write_config, executed in post_bls_sync. */
++typedef struct
++{
++  char *bootid;      /* deployment selector, matches the sealed ostree=/ostree/root.BOOTID */
++  guint index;       /* n_deployments - deployment_index, mirrors bootloader_entry_filename */
++  char *src_relpath; /* the deployment's UKI, relative to boot_fd */
++  char *seed_counter; /* boot-counter suffix ("+L[-D]" or NULL) for a fresh publish */
++} SdbootPublishItem;
++
++static void
++sdboot_publish_item_free (SdbootPublishItem *item)
++{
++  if (!item)
++    return;
++  g_free (item->bootid);
++  g_free (item->src_relpath);
++  g_free (item->seed_counter);
++  g_free (item);
++}
+ 
+ struct _OstreeBootloaderSdboot
+ {
+   GObject       parent_instance;
+ 
+   OstreeSysroot  *sysroot;
++  GPtrArray      *pending; /* (element-type SdbootPublishItem); write_config -> post_bls_sync */
+ };
+ 
+ typedef GObjectClass OstreeBootloaderSdbootClass;
+@@ -43,6 +71,65 @@ static void _ostree_bootloader_sdboot_bootloader_iface_init (OstreeBootloaderInt
+ G_DEFINE_TYPE_WITH_CODE (OstreeBootloaderSdboot, _ostree_bootloader_sdboot, G_TYPE_OBJECT,
+                          G_IMPLEMENT_INTERFACE (OSTREE_TYPE_BOOTLOADER, _ostree_bootloader_sdboot_bootloader_iface_init));
+ 
++/* A boot id is a conservative token (see ostree-sysroot-deploy.c). */
++static gboolean
++sdboot_bootid_valid (const char *bootid)
++{
++  if (!bootid || !*bootid)
++    return FALSE;
++  for (const char *p = bootid; *p; p++)
++    if (!g_ascii_islower (*p) && !g_ascii_isdigit (*p) && *p != '.' && *p != '_' && *p != '-')
++      return FALSE;
++  return TRUE;
++}
++
++/* Build "ostree-<index>-<bootid>[<counter>].efi"; @counter is "+L[-D]" or NULL. */
++char *
++_ostree_sdboot_type2_filename (guint index, const char *bootid, const char *counter)
++{
++  return g_strdup_printf ("ostree-%u-%s%s.efi", index, bootid, counter ?: "");
++}
++
++/* Parse "ostree-<index>-<bootid>[+L[-D]].efi". The bootid charset excludes '+', so the
++ * counter split is unambiguous. Returns FALSE (without error) for non-matching names. */
++gboolean
++_ostree_sdboot_parse_type2_filename (const char *name, guint *out_index, char **out_bootid,
++                                     char **out_counter)
++{
++  if (!g_str_has_prefix (name, "ostree-") || !g_str_has_suffix (name, ".efi"))
++    return FALSE;
++
++  const char *p = name + strlen ("ostree-");
++  const char *dash = strchr (p, '-');
++  if (!dash || dash == p)
++    return FALSE;
++  for (const char *q = p; q < dash; q++)
++    if (!g_ascii_isdigit (*q))
++      return FALSE;
++
++  g_autofree char *index_str = g_strndup (p, dash - p);
++  guint64 index;
++  if (!g_ascii_string_to_unsigned (index_str, 10, 0, G_MAXUINT, &index, NULL))
++    return FALSE;
++
++  const char *rest = dash + 1;                    /* "<bootid>[+L[-D]].efi" */
++  size_t rest_len = strlen (rest) - strlen (".efi");
++  const char *plus = memchr (rest, '+', rest_len);
++  size_t bootid_len = plus ? (size_t)(plus - rest) : rest_len;
++
++  g_autofree char *bootid = g_strndup (rest, bootid_len);
++  if (!sdboot_bootid_valid (bootid))
++    return FALSE;
++
++  if (out_index)
++    *out_index = (guint)index;
++  if (out_bootid)
++    *out_bootid = g_steal_pointer (&bootid);
++  if (out_counter)
++    *out_counter = plus ? g_strndup (plus, rest_len - bootid_len) : NULL;
++  return TRUE;
++}
++
+ static gboolean
+ _ostree_bootloader_sdboot_query (OstreeBootloader *bootloader,
+                                 gboolean         *out_is_active,
+@@ -64,6 +151,22 @@ _ostree_bootloader_sdboot_get_name (OstreeBootloader *bootloader)
+   return "systemd-boot";
+ }
+ 
++/* Compute the boot-counter suffix a fresh EFI/Linux file should carry, mirroring
++ * bootloader_entry_filename() in ostree-sysroot-deploy.c. Returns "+L[-D]" or NULL. */
++static char *
++sdboot_seed_counter (OstreeRepo *repo, OstreeBootconfigParser *bootconfig)
++{
++  if (!repo->boot_counting)
++    return NULL;
++  if (!_ostree_bootconfig_parser_filename (bootconfig))
++    return g_strdup_printf ("+%u", repo->boot_counting);
++  guint64 left = ostree_bootconfig_parser_get_tries_left (bootconfig);
++  guint64 done = ostree_bootconfig_parser_get_tries_done (bootconfig);
++  if (!left && !done)
++    return NULL;
++  return g_strdup_printf ("+%" PRIu64 "-%" PRIu64, left, done);
++}
++
+ static gboolean
+ _ostree_bootloader_sdboot_write_config (OstreeBootloader *bootloader,
+                                        int               new_bootversion,
+@@ -72,6 +175,9 @@ _ostree_bootloader_sdboot_write_config (OstreeBootloader *bootloader,
+                                        GError          **error)
+ {
+   OstreeBootloaderSdboot *self = OSTREE_BOOTLOADER_SDBOOT (bootloader);
++  OstreeRepo *repo = ostree_sysroot_repo (self->sysroot);
++
++  g_clear_pointer (&self->pending, g_ptr_array_unref);
+ 
+   /* This should follow the symbolic link to the new bootversion. */
+   g_autofree char *config_contents =
+@@ -80,6 +186,30 @@ _ostree_bootloader_sdboot_write_config (OstreeBootloader *bootloader,
+   if (!config_contents)
+     return FALSE;
+ 
++  /* In type-2 mode ostree publishes the UKIs into EFI/Linux and owns their ordering by
++   * file name; pin the boot loader's default to the ostree family so a stray .efi that
++   * sorts higher (or a firmware-provided entry) cannot become the default. Only add the
++   * line if the image did not already set an explicit default. */
++  g_autofree char *amended_config = NULL;
++  if (repo->sdboot_type2)
++    {
++      gboolean has_default = FALSE;
++      g_auto (GStrv) lines = g_strsplit (config_contents, "\n", -1);
++      for (char **it = lines; *it; it++)
++        if (g_str_has_prefix (g_strchug (*it), "default"))
++          {
++            has_default = TRUE;
++            break;
++          }
++      if (!has_default)
++        {
++          amended_config = g_strconcat (config_contents,
++                                        g_str_has_suffix (config_contents, "\n") ? "" : "\n",
++                                        sdboot_default_line, "\n", NULL);
++          config_contents = g_steal_pointer (&amended_config);
++        }
++    }
++
+   g_autofree char *new_config_path = g_strdup_printf ("boot/loader.%d/loader.conf", new_bootversion);
+   if (!glnx_file_replace_contents_at (self->sysroot->sysroot_fd, new_config_path,
+                                       (guint8*)config_contents, strlen (config_contents),
+@@ -87,6 +217,173 @@ _ostree_bootloader_sdboot_write_config (OstreeBootloader *bootloader,
+                                       cancellable, error))
+     return FALSE;
+ 
++  if (!repo->sdboot_type2)
++    return TRUE;
++
++  /* Build the publish plan; validation errors here abort the deploy before the
++   * boot-directory swap, leaving the running system untouched. */
++  g_autoptr (GPtrArray) plan
++      = g_ptr_array_new_with_free_func ((GDestroyNotify)sdboot_publish_item_free);
++  g_autoptr (GHashTable) seen_bootids = g_hash_table_new (g_str_hash, g_str_equal);
++  for (guint i = 0; i < new_deployments->len; i++)
++    {
++      OstreeDeployment *deployment = new_deployments->pdata[i];
++      OstreeBootconfigParser *bootconfig = ostree_deployment_get_bootconfig (deployment);
++      const char *bootid = ostree_bootconfig_parser_get (bootconfig, "x-ostree-uki-boot-id");
++      const char *uki = ostree_bootconfig_parser_get (bootconfig, "uki");
++      if (!bootid || !uki)
++        return glnx_throw (error, "systemd-boot type-2 mode requires sealed UKI deployments");
++      if (!sdboot_bootid_valid (bootid))
++        return glnx_throw (error, "Invalid ostree-boot-id '%s'", bootid);
++      if (!g_hash_table_add (seen_bootids, (gpointer)bootid))
++        return glnx_throw (error,
++                           "Two deployments share sealed boot id '%s'; redeploying the same "
++                           "image is unsupported with systemd-boot type-2 entries",
++                           bootid);
++
++      /* "uki" is bootprefix + bootcsumdir + "/" + name; make it relative to boot_fd. */
++      const char *src = uki;
++      while (*src == '/')
++        src++;
++      if (g_str_has_prefix (src, "boot/"))
++        src += strlen ("boot/");
++
++      SdbootPublishItem *item = g_new0 (SdbootPublishItem, 1);
++      item->bootid = g_strdup (bootid);
++      item->index = new_deployments->len - ostree_deployment_get_index (deployment);
++      item->src_relpath = g_strdup (src);
++      item->seed_counter = sdboot_seed_counter (repo, bootconfig);
++      g_ptr_array_add (plan, item);
++    }
++
++  self->pending = g_steal_pointer (&plan);
++  return TRUE;
++}
++
++/* An existing EFI/Linux/ostree-*.efi file, grouped per boot id. */
++typedef struct
++{
++  char *name;
++  guint index;
++  char *counter; /* "+L[-D]" or NULL */
++} SdbootExisting;
++
++static void
++sdboot_existing_free (SdbootExisting *e)
++{
++  if (!e)
++    return;
++  g_free (e->name);
++  g_free (e->counter);
++  g_free (e);
++}
++
++static gboolean
++_ostree_bootloader_sdboot_post_bls_sync (OstreeBootloader *bootloader, int bootversion,
++                                         GCancellable *cancellable, GError **error)
++{
++  OstreeBootloaderSdboot *self = OSTREE_BOOTLOADER_SDBOOT (bootloader);
++  OstreeRepo *repo = ostree_sysroot_repo (self->sysroot);
++
++  if (!repo->sdboot_type2 || !self->pending)
++    return TRUE;
++
++  if (!_ostree_sysroot_ensure_boot_fd (self->sysroot, error))
++    return FALSE;
++
++  if (!glnx_shutil_mkdir_p_at (self->sysroot->boot_fd, sdboot_uki_dir, 0755, cancellable, error))
++    return FALSE;
++  glnx_autofd int efi_dfd = -1;
++  if (!glnx_opendirat (self->sysroot->boot_fd, sdboot_uki_dir, TRUE, &efi_dfd, error))
++    return FALSE;
++
++  /* Index the existing files per boot id. Several may share a boot id if a previous
++   * publish crashed mid-rename; we pick one live representative below. */
++  g_autoptr (GHashTable) existing_by_bootid
++      = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_ptr_array_unref);
++  g_auto (GLnxDirFdIterator) dfd_iter = { 0, };
++  if (!glnx_dirfd_iterator_init_at (efi_dfd, ".", FALSE, &dfd_iter, error))
++    return FALSE;
++  while (TRUE)
++    {
++      struct dirent *dent;
++      if (!glnx_dirfd_iterator_next_dent_ensure_dtype (&dfd_iter, &dent, cancellable, error))
++        return FALSE;
++      if (dent == NULL)
++        break;
++      if (dent->d_type != DT_REG)
++        continue;
++
++      guint idx;
++      g_autofree char *bootid = NULL;
++      g_autofree char *counter = NULL;
++      if (!_ostree_sdboot_parse_type2_filename (dent->d_name, &idx, &bootid, &counter))
++        continue; /* foreign file, never touched */
++
++      GPtrArray *list = g_hash_table_lookup (existing_by_bootid, bootid);
++      if (!list)
++        {
++          list = g_ptr_array_new_with_free_func ((GDestroyNotify)sdboot_existing_free);
++          g_hash_table_insert (existing_by_bootid, g_steal_pointer (&bootid), list);
++        }
++      SdbootExisting *e = g_new0 (SdbootExisting, 1);
++      e->name = g_strdup (dent->d_name);
++      e->index = idx;
++      e->counter = g_steal_pointer (&counter);
++      g_ptr_array_add (list, e);
++    }
++
++  /* PASS 1: install fresh copies for boot ids with no existing file. New content lands
++   * before anything is renamed, and the boot-id-bearing name cannot clobber a live file. */
++  for (guint i = 0; i < self->pending->len; i++)
++    {
++      SdbootPublishItem *item = self->pending->pdata[i];
++      if (g_hash_table_contains (existing_by_bootid, item->bootid))
++        continue;
++      g_autofree char *dest
++          = _ostree_sdboot_type2_filename (item->index, item->bootid, item->seed_counter);
++      if (!_ostree_sysroot_install_into_boot (repo, NULL, self->sysroot->boot_fd, item->src_relpath,
++                                              efi_dfd, dest, cancellable, error))
++        return FALSE;
++    }
++
++  /* PASS 2: rename files whose index moved (e.g. after set-default), preserving the live
++   * boot-counter suffix; the boot loader and systemd-bless-boot own that suffix. */
++  for (guint i = 0; i < self->pending->len; i++)
++    {
++      SdbootPublishItem *item = self->pending->pdata[i];
++      GPtrArray *list = g_hash_table_lookup (existing_by_bootid, item->bootid);
++      if (!list)
++        continue;
++
++      /* Prefer a file already at the wanted index; else a blessed (counter-free) one;
++       * else the first. */
++      SdbootExisting *chosen = list->pdata[0];
++      for (guint j = 0; j < list->len; j++)
++        {
++          SdbootExisting *e = list->pdata[j];
++          if (e->index == item->index)
++            {
++              chosen = e;
++              break;
++            }
++          if (!e->counter)
++            chosen = e;
++        }
++
++      if (chosen->index == item->index)
++        continue; /* already correctly named, live counter intact */
++
++      g_autofree char *dest
++          = _ostree_sdboot_type2_filename (item->index, item->bootid, chosen->counter);
++      if (!glnx_renameat (efi_dfd, chosen->name, efi_dfd, dest, error))
++        return FALSE;
++    }
++
++  if (syncfs (efi_dfd) != 0)
++    return glnx_throw_errno_prefix (error, "syncfs(EFI/Linux)");
++
++  g_clear_pointer (&self->pending, g_ptr_array_unref);
+   return TRUE;
+ }
+ 
+@@ -96,6 +393,7 @@ _ostree_bootloader_sdboot_finalize (GObject *object)
+   OstreeBootloaderSdboot *self = OSTREE_BOOTLOADER_SDBOOT (object);
+ 
+   g_clear_object (&self->sysroot);
++  g_clear_pointer (&self->pending, g_ptr_array_unref);
+ 
+   G_OBJECT_CLASS (_ostree_bootloader_sdboot_parent_class)->finalize (object);
+ }
+@@ -111,6 +409,7 @@ _ostree_bootloader_sdboot_bootloader_iface_init (OstreeBootloaderInterface *ifac
+   iface->query = _ostree_bootloader_sdboot_query;
+   iface->get_name = _ostree_bootloader_sdboot_get_name;
+   iface->write_config = _ostree_bootloader_sdboot_write_config;
++  iface->post_bls_sync = _ostree_bootloader_sdboot_post_bls_sync;
+ }
+ 
+ void
+diff --git a/src/libostree/ostree-impl-system-generator.c b/src/libostree/ostree-impl-system-generator.c
+index a21ff6bb..ba5d5ba9 100644
+--- a/src/libostree/ostree-impl-system-generator.c
++++ b/src/libostree/ostree-impl-system-generator.c
+@@ -344,8 +344,14 @@ fstab_generator (const char *ostree_target, const bool is_aboot, const char *nor
+       if (!_ostree_sysroot_parse_bootlink_aboot (ostree_target, &stateroot, error))
+         return glnx_prefix_error (error, "Parsing aboot stateroot");
+     }
+-  else if (!_ostree_sysroot_parse_bootlink (ostree_target, NULL, &stateroot, NULL, NULL, error))
+-    return glnx_prefix_error (error, "Parsing stateroot");
++  else if (!_ostree_sysroot_parse_bootlink (ostree_target, NULL, &stateroot, NULL, NULL, NULL))
++    {
++      /* Not a /ostree/boot.N bootlink: support fixed selector symlinks like
++       * /ostree/root.BOOTID (sealed UKI deployments), which resolve to the
++       * deployment directory just like the aboot slot links. */
++      if (!_ostree_sysroot_parse_bootlink_aboot (ostree_target, &stateroot, error))
++        return glnx_prefix_error (error, "Parsing stateroot");
++    }
+ 
+   /* Load /etc/fstab if it exists, and look for a /var mount */
+   g_autoptr (OtLibMountFile) fstab = setmntent (fstab_path, "re");
+diff --git a/src/libostree/ostree-repo-private.h b/src/libostree/ostree-repo-private.h
+index 990e6954..40c6d94b 100644
+--- a/src/libostree/ostree-repo-private.h
++++ b/src/libostree/ostree-repo-private.h
+@@ -249,6 +249,7 @@ struct OstreeRepo
+       *bls_append_values;     /* Parsed key-values from bls-append-except-default key in config. */
+   gboolean enable_bootprefix; /* If true, prepend bootloader entries with /boot */
+   guint boot_counting;
++  gboolean sdboot_type2; /* If true, publish sealed UKIs as systemd-boot type-2 entries */
+ 
+   OstreeRepo *parent_repo;
+ };
+diff --git a/src/libostree/ostree-repo.c b/src/libostree/ostree-repo.c
+index f20611b4..e99120ca 100644
+--- a/src/libostree/ostree-repo.c
++++ b/src/libostree/ostree-repo.c
+@@ -3349,6 +3349,10 @@ reload_sysroot_config (OstreeRepo *self, GCancellable *cancellable, GError **err
+     return glnx_prefix_error (error, "Parsing sysroot.boot-counting-tries");
+   self->boot_counting = (guint)v;
+ 
++  if (!ot_keyfile_get_boolean_with_default (self->config, "sysroot", "sd-boot-type2", FALSE,
++                                            &self->sdboot_type2, error))
++    return FALSE;
++
+   g_autofree char *bootloader = NULL;
+ 
+   if (!ot_keyfile_get_value_with_default_group_optional (self->config, "sysroot", "bootloader",
+diff --git a/src/libostree/ostree-sysroot-cleanup.c b/src/libostree/ostree-sysroot-cleanup.c
+index 6d2accde..59595207 100644
+--- a/src/libostree/ostree-sysroot-cleanup.c
++++ b/src/libostree/ostree-sysroot-cleanup.c
+@@ -294,6 +294,141 @@ cleanup_old_deployments (OstreeSysroot *self, GCancellable *cancellable, GError
+   return TRUE;
+ }
+ 
++/* Remove dangling /ostree/root.BOOTID selector symlinks (sealed UKI
++ * deployments) and aboot slot links; they become dangling once the deployment
++ * they point to has been removed by cleanup_old_deployments().
++ */
++static gboolean
++cleanup_root_selector_links (OstreeSysroot *self, GCancellable *cancellable, GError **error)
++{
++  g_auto (GLnxDirFdIterator) dfd_iter = {
++    0,
++  };
++  gboolean exists;
++  if (!ot_dfd_iter_init_allow_noent (self->sysroot_fd, "ostree", &dfd_iter, &exists, error))
++    return FALSE;
++  if (!exists)
++    return TRUE;
++
++  while (TRUE)
++    {
++      struct dirent *dent;
++
++      if (!glnx_dirfd_iterator_next_dent_ensure_dtype (&dfd_iter, &dent, cancellable, error))
++        return FALSE;
++      if (dent == NULL)
++        break;
++
++      if (dent->d_type != DT_LNK || !g_str_has_prefix (dent->d_name, "root."))
++        continue;
++
++      struct stat stbuf;
++      if (!glnx_fstatat_allow_noent (dfd_iter.fd, dent->d_name, &stbuf, 0, error))
++        return FALSE;
++      if (errno != ENOENT)
++        continue;
++
++      if (!glnx_unlinkat (dfd_iter.fd, dent->d_name, 0, error))
++        return FALSE;
++    }
++
++  return TRUE;
++}
++
++/* Remove EFI/Linux/ostree-*.efi UKIs (systemd-boot type-2 entries) whose deployment is
++ * gone, and stale-index duplicates left by an interrupted publish. Runs after a
++ * successful deployment write, so a missing boot id means a removed deployment. Files
++ * whose name we cannot parse (foreign entries) are never touched.
++ */
++static gboolean
++cleanup_sdboot_type2_ukis (OstreeSysroot *self, GCancellable *cancellable, GError **error)
++{
++  /* boot id -> expected index for every live deployment. */
++  g_autoptr (GHashTable) live_index
++      = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++  for (guint i = 0; i < self->deployments->len; i++)
++    {
++      OstreeDeployment *deployment = self->deployments->pdata[i];
++      OstreeBootconfigParser *bootconfig = ostree_deployment_get_bootconfig (deployment);
++      const char *bootid
++          = bootconfig ? ostree_bootconfig_parser_get (bootconfig, "x-ostree-uki-boot-id") : NULL;
++      if (!bootid)
++        continue;
++      guint index = self->deployments->len - ostree_deployment_get_index (deployment);
++      g_hash_table_replace (live_index, g_strdup (bootid), GUINT_TO_POINTER (index));
++    }
++
++  g_auto (GLnxDirFdIterator) dfd_iter = {
++    0,
++  };
++  gboolean exists;
++  if (!ot_dfd_iter_init_allow_noent (self->boot_fd, "EFI/Linux", &dfd_iter, &exists, error))
++    return FALSE;
++  if (!exists)
++    return TRUE;
++
++  while (TRUE)
++    {
++      struct dirent *dent;
++      if (!glnx_dirfd_iterator_next_dent_ensure_dtype (&dfd_iter, &dent, cancellable, error))
++        return FALSE;
++      if (dent == NULL)
++        break;
++      if (dent->d_type != DT_REG)
++        continue;
++
++      guint index;
++      g_autofree char *bootid = NULL;
++      if (!_ostree_sdboot_parse_type2_filename (dent->d_name, &index, &bootid, NULL))
++        continue; /* foreign file, keep */
++
++      gpointer live;
++      if (!g_hash_table_lookup_extended (live_index, bootid, NULL, &live))
++        {
++          /* No live deployment for this boot id. */
++          if (!glnx_unlinkat (dfd_iter.fd, dent->d_name, 0, error))
++            return FALSE;
++        }
++      else if (index != GPOINTER_TO_UINT (live))
++        {
++          /* Wrong index; only remove it if a correctly-named sibling exists, so a
++           * mid-rename crash never deletes the only copy of a live deployment. */
++          g_autofree char *good
++              = _ostree_sdboot_type2_filename (GPOINTER_TO_UINT (live), bootid, NULL);
++          struct stat stbuf;
++          if (!glnx_fstatat_allow_noent (dfd_iter.fd, good, &stbuf, 0, error))
++            return FALSE;
++          gboolean sibling = errno == 0;
++          if (!sibling)
++            {
++              /* Also accept a counter-suffixed sibling. */
++              g_auto (GLnxDirFdIterator) scan = { 0, };
++              if (!glnx_dirfd_iterator_init_at (dfd_iter.fd, ".", FALSE, &scan, error))
++                return FALSE;
++              g_autofree char *prefix
++                  = g_strdup_printf ("ostree-%u-%s", GPOINTER_TO_UINT (live), bootid);
++              while (!sibling)
++                {
++                  struct dirent *d2;
++                  if (!glnx_dirfd_iterator_next_dent_ensure_dtype (&scan, &d2, cancellable, error))
++                    return FALSE;
++                  if (d2 == NULL)
++                    break;
++                  guint i2;
++                  g_autofree char *b2 = NULL;
++                  if (_ostree_sdboot_parse_type2_filename (d2->d_name, &i2, &b2, NULL)
++                      && i2 == GPOINTER_TO_UINT (live) && g_str_equal (b2, bootid))
++                    sibling = TRUE;
++                }
++            }
++          if (sibling && !glnx_unlinkat (dfd_iter.fd, dent->d_name, 0, error))
++            return FALSE;
++        }
++    }
++
++  return TRUE;
++}
++
+ /* This function deletes any files in the bootfs unreferenced by the active
+  * bootloader configuration.
+  */
+@@ -377,6 +512,9 @@ _ostree_sysroot_cleanup_bootfs (OstreeSysroot *self, GCancellable *cancellable,
+         }
+     }
+ 
++  if (!cleanup_sdboot_type2_ukis (self, cancellable, error))
++    return FALSE;
++
+   return TRUE;
+ }
+ 
+@@ -556,6 +694,9 @@ _ostree_sysroot_cleanup_internal (OstreeSysroot *self, gboolean do_prune_repo,
+   if (!cleanup_old_deployments (self, cancellable, error))
+     return glnx_prefix_error (error, "Cleaning deployments");
+ 
++  if (!cleanup_root_selector_links (self, cancellable, error))
++    return glnx_prefix_error (error, "Cleaning root selector links");
++
+   if (!_ostree_sysroot_cleanup_bootfs (self, cancellable, error))
+     return glnx_prefix_error (error, "Cleaning bootfs");
+ 
+diff --git a/src/libostree/ostree-sysroot-deploy.c b/src/libostree/ostree-sysroot-deploy.c
+index 7963bebc..8df9ee86 100644
+--- a/src/libostree/ostree-sysroot-deploy.c
++++ b/src/libostree/ostree-sysroot-deploy.c
+@@ -111,14 +111,17 @@ sysroot_flags_to_copy_flags (GLnxFileCopyFlags defaults, OstreeSysrootDebugFlags
+  * right now for kernels/initramfs/device trees in /boot, where we can just
+  * hardlink if we're on the same partition.
+  */
+-static gboolean
+-install_into_boot (OstreeRepo *repo, OstreeSePolicy *sepolicy, int src_dfd, const char *src_subpath,
+-                   int dest_dfd, const char *dest_subpath, GCancellable *cancellable,
+-                   GError **error)
++gboolean
++_ostree_sysroot_install_into_boot (OstreeRepo *repo, OstreeSePolicy *sepolicy, int src_dfd,
++                                   const char *src_subpath, int dest_dfd, const char *dest_subpath,
++                                   GCancellable *cancellable, GError **error)
+ {
+   if (linkat (src_dfd, src_subpath, dest_dfd, dest_subpath, 0) == 0)
+     return TRUE; /* Note early return */
+-  if (!G_IN_SET (errno, EMLINK, EXDEV))
++  /* EMLINK/EXDEV: cross-device (e.g. rootfs -> vfat ESP). EPERM/EOPNOTSUPP: same
++   * filesystem but no hardlink support at all (vfat ESP -> vfat ESP, for the
++   * type-2 UKI publisher). In all of these, fall back to a copy. */
++  if (!G_IN_SET (errno, EMLINK, EXDEV, EPERM, EOPNOTSUPP))
+     return glnx_throw_errno_prefix (error, "linkat(%s)", dest_subpath);
+ 
+   /* Otherwise, copy */
+@@ -184,6 +187,15 @@ install_into_boot (OstreeRepo *repo, OstreeSePolicy *sepolicy, int src_dfd, cons
+   return TRUE;
+ }
+ 
++static gboolean
++install_into_boot (OstreeRepo *repo, OstreeSePolicy *sepolicy, int src_dfd, const char *src_subpath,
++                   int dest_dfd, const char *dest_subpath, GCancellable *cancellable,
++                   GError **error)
++{
++  return _ostree_sysroot_install_into_boot (repo, sepolicy, src_dfd, src_subpath, dest_dfd,
++                                            dest_subpath, cancellable, error);
++}
++
+ /* Copy ownership, mode, and xattrs from source directory to destination */
+ static gboolean
+ dirfd_copy_attributes_and_xattrs (int src_parent_dfd, const char *src_name, int src_dfd,
+@@ -1059,6 +1071,7 @@ typedef struct
+   char *aboot_namever;
+   char *uki_srcpath;
+   char *uki_namever;
++  char *uki_boot_id;
+   char *bootcsum;
+ } OstreeKernelLayout;
+ static void
+@@ -1077,6 +1090,7 @@ _ostree_kernel_layout_free (OstreeKernelLayout *layout)
+   g_free (layout->aboot_namever);
+   g_free (layout->uki_srcpath);
+   g_free (layout->uki_namever);
++  g_free (layout->uki_boot_id);
+   g_free (layout->bootcsum);
+   g_free (layout);
+ }
+@@ -1090,6 +1104,22 @@ _ostree_kernel_layout_new (void)
+   return ret;
+ }
+ 
++/* A boot id ends up both in a kernel argument and in a file name; keep it to
++ * a conservative character set.
++ */
++static gboolean
++_ostree_validate_boot_id (const char *boot_id)
++{
++  if (!*boot_id)
++    return FALSE;
++  for (const char *p = boot_id; *p; p++)
++    {
++      if (!g_ascii_isalnum (*p) && *p != '.' && *p != '_' && *p != '-')
++        return FALSE;
++    }
++  return TRUE;
++}
++
+ /* See get_kernel_from_tree() below */
+ static gboolean
+ get_kernel_from_tree_usrlib_modules (OstreeSysroot *sysroot, int deployment_dfd,
+@@ -1265,6 +1295,27 @@ get_kernel_from_tree_usrlib_modules (OstreeSysroot *sysroot, int deployment_dfd,
+     }
+   glnx_close_fd (&fd);
+ 
++  /* A sealed UKI embeds its kernel command line, including a fixed
++   * "ostree=/ostree/root.BOOTID" deployment selector; the tree ships BOOTID
++   * next to the UKI so deploys can maintain the selector symlink (see
++   * install_deployment_kernel()). */
++  if (ret_layout->uki_srcpath != NULL)
++    {
++      if (!glnx_fstatat_allow_noent (ret_layout->boot_dfd, "ostree-boot-id", NULL, 0, error))
++        return FALSE;
++      if (errno == 0)
++        {
++          g_autofree char *boot_id = glnx_file_get_contents_utf8_at (
++              ret_layout->boot_dfd, "ostree-boot-id", NULL, cancellable, error);
++          if (boot_id == NULL)
++            return FALSE;
++          g_strstrip (boot_id);
++          if (!_ostree_validate_boot_id (boot_id))
++            return glnx_throw (error, "Invalid ostree-boot-id '%s'", boot_id);
++          ret_layout->uki_boot_id = g_steal_pointer (&boot_id);
++        }
++    }
++
+   /* And finally, look for any HMAC file. This is needed for FIPS mode on some distros. */
+   if (!glnx_fstatat_allow_noent (ret_layout->boot_dfd, ".vmlinuz.hmac", NULL, 0, error))
+     return FALSE;
+@@ -1870,10 +1921,17 @@ install_deployment_kernel (OstreeSysroot *sysroot, int new_bootversion,
+   if (!_ostree_sysroot_ensure_boot_fd (sysroot, error))
+     return FALSE;
+ 
++  OstreeRepo *repo = ostree_sysroot_repo (sysroot);
++
+   const char *osname = ostree_deployment_get_osname (deployment);
+   const char *bootcsum = ostree_deployment_get_bootcsum (deployment);
+   g_autofree char *bootcsumdir = g_strdup_printf ("ostree/%s-%s", osname, bootcsum);
+-  g_autofree char *bootconfdir = g_strdup_printf ("loader.%d/entries", new_bootversion);
++  /* With systemd-boot type-2 publishing the bootloader discovers the UKIs from
++   * EFI/Linux; the entries are ostree bookkeeping only and live in a directory
++   * the bootloader does not scan. */
++  g_autofree char *bootconfdir
++      = g_strdup_printf (repo->sdboot_type2 ? "loader.%d/entries.ostree" : "loader.%d/entries",
++                         new_bootversion);
+ 
+   if (!glnx_shutil_mkdir_p_at (sysroot->boot_fd, bootcsumdir, 0775, cancellable, error))
+     return FALSE;
+@@ -1885,13 +1943,21 @@ install_deployment_kernel (OstreeSysroot *sysroot, int new_bootversion,
+   if (!glnx_shutil_mkdir_p_at (sysroot->boot_fd, bootconfdir, 0775, cancellable, error))
+     return FALSE;
+ 
+-  OstreeRepo *repo = ostree_sysroot_repo (sysroot);
+-
+   const char *bootprefix = repo->enable_bootprefix ? "/boot/" : "/";
+ 
+   struct stat stbuf;
+   /* If we're updating an old loader entry that doesn't use uki, keep it the way it was */
+   gboolean uki = kernel_layout->uki_srcpath && !ostree_bootconfig_parser_get (bootconfig, "linux");
++  /* A sealed UKI embeds its full kernel command line with a fixed
++   * "ostree=/ostree/root.BOOTID" deployment selector instead of a mutable
++   * bootlink argument; we maintain the selector symlink and keep kernel
++   * arguments out of the bootloader entry so the (signed) embedded command
++   * line stays authoritative. */
++  gboolean sealed = uki && kernel_layout->uki_boot_id != NULL;
++  if (repo->sdboot_type2 && !sealed)
++    return glnx_throw (error,
++                       "sysroot.sd-boot-type2 requires sealed UKI deployments "
++                       "(uki.efi with an ostree-boot-id)");
+   if (uki)
+     {
+       g_assert (kernel_layout->uki_namever);
+@@ -1907,6 +1973,22 @@ install_deployment_kernel (OstreeSysroot *sysroot, int new_bootversion,
+         }
+     }
+ 
++  if (sealed)
++    {
++      /* The selector symlink the UKI's embedded ostree=/ostree/root.BOOTID
++       * argument resolves through, relative to /ostree like the aboot slot
++       * links (see _ostree_sysroot_parse_bootlink_aboot()). */
++      g_autofree char *selector_name = g_strdup_printf ("root.%s", kernel_layout->uki_boot_id);
++      g_autofree char *selector_target = g_strdup_printf (
++          "deploy/%s/deploy/%s.%d", osname, ostree_deployment_get_csum (deployment),
++          ostree_deployment_get_deployserial (deployment));
++      glnx_autofd int ostree_dfd = -1;
++      if (!glnx_opendirat (sysroot->sysroot_fd, "ostree", TRUE, &ostree_dfd, error))
++        return FALSE;
++      if (!symlink_at_replace (selector_target, ostree_dfd, selector_name, cancellable, error))
++        return FALSE;
++    }
++
+   /* Install (hardlink/copy) the kernel into /boot/ostree/osname-${bootcsum} if
+    * it doesn't exist already.
+    */
+@@ -2190,13 +2272,39 @@ install_deployment_kernel (OstreeSysroot *sysroot, int new_bootversion,
+     }
+ 
+   /* Note this is parsed in ostree-impl-system-generator.c */
+-  g_autofree char *ostree_kernel_arg
+-      = g_strdup_printf ("ostree=/ostree/boot.%d/%s/%s/%d", new_bootversion, osname, bootcsum,
+-                         ostree_deployment_get_bootserial (deployment));
+-  ostree_kernel_args_replace_take (kargs, g_steal_pointer (&ostree_kernel_arg));
++  g_autofree char *bootlink = g_strdup_printf ("/ostree/boot.%d/%s/%s/%d", new_bootversion,
++                                               osname, bootcsum,
++                                               ostree_deployment_get_bootserial (deployment));
++  if (sealed)
++    {
++      /* The kernel command line (with the root.BOOTID selector) is embedded
++       * in the UKI; leave the entry without options so the boot loader passes
++       * no load options and systemd-stub uses the embedded .cmdline regardless
++       * of Secure Boot state. Record the bootlink in a vendor key so
++       * deployments can still be enumerated from the entry (see
++       * get_ostree_kernel_arg_from_config()). */
++      if (val && *val)
++        ot_journal_print (LOG_INFO,
++                          "Ignoring kernel arguments of sealed UKI deployment %s.%d: %s",
++                          ostree_deployment_get_csum (deployment),
++                          ostree_deployment_get_deployserial (deployment), val);
++      ostree_bootconfig_parser_set (bootconfig, "options", NULL);
++      ostree_bootconfig_parser_set (bootconfig, "x-ostree-bootlink", bootlink);
++
++      /* The type-2 publisher and the EFI/Linux garbage collector identify the
++       * deployment's UKI by its boot id (see ostree-bootloader-sd-boot.c). */
++      if (repo->sdboot_type2)
++        ostree_bootconfig_parser_set (bootconfig, "x-ostree-uki-boot-id",
++                                      kernel_layout->uki_boot_id);
++    }
++  else
++    {
++      g_autofree char *ostree_kernel_arg = g_strconcat ("ostree=", bootlink, NULL);
++      ostree_kernel_args_replace_take (kargs, g_steal_pointer (&ostree_kernel_arg));
+ 
+-  g_autofree char *options_key = ostree_kernel_args_to_string (kargs);
+-  ostree_bootconfig_parser_set (bootconfig, "options", options_key);
++      g_autofree char *options_key = ostree_kernel_args_to_string (kargs);
++      ostree_bootconfig_parser_set (bootconfig, "options", options_key);
++    }
+ 
+   /* Only append to this BLS config if:
+    * - this is not the default deployment
+@@ -2508,11 +2616,21 @@ write_deployments_bootswap (OstreeSysroot *self, GPtrArray *new_deployments,
+ {
+   const int new_bootversion = self->bootversion ? 0 : 1;
+ 
++  /* Clear both entry directory flavors so that switching sysroot.sd-boot-type2 in
++   * either direction cannot leave a stale copy of the other layout behind. */
+   g_autofree char *new_loader_entries_dir
+       = g_strdup_printf ("boot/loader.%d/entries", new_bootversion);
++  g_autofree char *new_loader_entries_ostree_dir
++      = g_strdup_printf ("boot/loader.%d/entries.ostree", new_bootversion);
+   if (!glnx_shutil_rm_rf_at (self->sysroot_fd, new_loader_entries_dir, cancellable, error))
+     return FALSE;
+-  if (!glnx_shutil_mkdir_p_at (self->sysroot_fd, new_loader_entries_dir, 0755, cancellable, error))
++  if (!glnx_shutil_rm_rf_at (self->sysroot_fd, new_loader_entries_ostree_dir, cancellable, error))
++    return FALSE;
++  if (!glnx_shutil_mkdir_p_at (self->sysroot_fd,
++                               ostree_sysroot_repo (self)->sdboot_type2
++                                   ? new_loader_entries_ostree_dir
++                                   : new_loader_entries_dir,
++                               0755, cancellable, error))
+     return FALSE;
+ 
+   /* Only show the osname in bootloader titles if there are multiple
+@@ -4478,7 +4596,10 @@ ostree_sysroot_deployment_set_kargs_in_place (OstreeSysroot *self, OstreeDeploym
+       g_autofree char *bootconf_filename
+           = bootloader_entry_filename (self, self->deployments->len, deployment);
+ 
+-      g_autofree char *bootconfdir = g_strdup_printf ("loader.%d/entries", self->bootversion);
++      g_autofree char *bootconfdir = g_strdup_printf (ostree_sysroot_repo (self)->sdboot_type2
++                                                           ? "loader.%d/entries.ostree"
++                                                           : "loader.%d/entries",
++                                                       self->bootversion);
+       glnx_autofd int bootconf_dfd = -1;
+       if (!glnx_opendirat (self->boot_fd, bootconfdir, TRUE, &bootconf_dfd, error))
+         return FALSE;
+@@ -4551,17 +4672,18 @@ ostree_sysroot_deployment_can_soft_reboot (OstreeSysroot *self, OstreeDeployment
+     return FALSE;
+ 
+   g_autoptr (OstreeKernelArgs) booted_kargs = _ostree_deployment_get_kargs (booted_deployment);
+-  g_assert (booted_kargs);
+-
+   g_autoptr (OstreeKernelArgs) target_kargs = _ostree_deployment_get_kargs (deployment);
+-  // The target kargs can be unset, which means use the merge kargs (same as booted, usually)
+-  if (!target_kargs)
++  // The kargs can be unset: for the target that means use the merge kargs
++  // (same as booted, usually); sealed UKI deployments carry no kargs in their
++  // bootconfig at all (the command line is embedded in the UKI, and the same
++  // boot checksum means the same UKI).
++  if (!booted_kargs || !target_kargs)
+     return TRUE;
+ 
+   // Compare kargs without the ostree= entry, as that will vary per bootlink even for
+   // the same boot checksum.
+-  g_assert (ostree_kernel_args_delete_if_present (booted_kargs, "ostree", NULL));
+-  g_assert (ostree_kernel_args_delete_if_present (target_kargs, "ostree", NULL));
++  (void)ostree_kernel_args_delete_if_present (booted_kargs, "ostree", NULL);
++  (void)ostree_kernel_args_delete_if_present (target_kargs, "ostree", NULL);
+   return _ostree_kernel_args_equal (booted_kargs, target_kargs);
+ }
+ 
+diff --git a/src/libostree/ostree-sysroot-private.h b/src/libostree/ostree-sysroot-private.h
+index f5c70872..de90c7fc 100644
+--- a/src/libostree/ostree-sysroot-private.h
++++ b/src/libostree/ostree-sysroot-private.h
+@@ -204,6 +204,16 @@ gboolean _ostree_sysroot_parse_bootdir_name (const char *name, char **out_osname
+ gboolean _ostree_sysroot_list_all_boot_directories (OstreeSysroot *self, char ***out_bootdirs,
+                                                     GCancellable *cancellable, GError **error);
+ 
++/* Shared with the systemd-boot backend and the cleanup code for publishing sealed UKIs
++ * as boot loader specification type-2 entries under EFI/Linux. */
++gboolean _ostree_sysroot_install_into_boot (OstreeRepo *repo, OstreeSePolicy *sepolicy, int src_dfd,
++                                            const char *src_subpath, int dest_dfd,
++                                            const char *dest_subpath, GCancellable *cancellable,
++                                            GError **error);
++gboolean _ostree_sdboot_parse_type2_filename (const char *name, guint *out_index, char **out_bootid,
++                                              char **out_counter);
++char *_ostree_sdboot_type2_filename (guint index, const char *bootid, const char *counter);
++
+ gboolean _ostree_sysroot_parse_bootlink (const char *bootlink, int *out_entry_bootversion,
+                                          char **out_osname, char **out_bootcsum,
+                                          int *out_treebootserial, GError **error);
+diff --git a/src/libostree/ostree-sysroot.c b/src/libostree/ostree-sysroot.c
+index e6d41302..293e00c3 100644
+--- a/src/libostree/ostree-sysroot.c
++++ b/src/libostree/ostree-sysroot.c
+@@ -685,10 +685,21 @@ _ostree_sysroot_read_boot_loader_configs (OstreeSysroot *self, int bootversion,
+   if (!read_current_bootversion (self, &current_version, cancellable, error))
+     return FALSE;
+ 
+-  if (current_version == bootversion)
+-    entries_path = g_strdup ("loader/entries");
++  const char *base = current_version == bootversion ? "loader" : NULL;
++  g_autofree char *base_versioned = NULL;
++  if (!base)
++    base = base_versioned = g_strdup_printf ("loader.%d", bootversion);
++
++  /* Deployments published as systemd-boot type-2 entries keep their bookkeeping in
++   * entries.ostree, which the boot loader does not scan; fall back to the classic
++   * entries directory so pre-migration deployments stay enumerable. */
++  g_autofree char *entries_ostree = g_strconcat (base, "/entries.ostree", NULL);
++  if (!glnx_fstatat_allow_noent (self->boot_fd, entries_ostree, NULL, 0, error))
++    return FALSE;
++  if (errno == 0)
++    entries_path = g_steal_pointer (&entries_ostree);
+   else
+-    entries_path = g_strdup_printf ("loader.%d/entries", bootversion);
++    entries_path = g_strconcat (base, "/entries", NULL);
+ 
+   gboolean entries_exists;
+   g_auto (GLnxDirFdIterator) dfd_iter = {
+@@ -1013,18 +1024,20 @@ static char *
+ get_ostree_kernel_arg_from_config (OstreeBootconfigParser *config)
+ {
+   const char *options = ostree_bootconfig_parser_get (config, "options");
+-  if (!options)
+-    return NULL;
+-
+-  g_auto (GStrv) opts = g_strsplit (options, " ", -1);
+-  for (char **iter = opts; *iter; iter++)
++  if (options)
+     {
+-      const char *opt = *iter;
+-      if (g_str_has_prefix (opt, "ostree="))
+-        return g_strdup (opt + strlen ("ostree="));
++      g_auto (GStrv) opts = g_strsplit (options, " ", -1);
++      for (char **iter = opts; *iter; iter++)
++        {
++          const char *opt = *iter;
++          if (g_str_has_prefix (opt, "ostree="))
++            return g_strdup (opt + strlen ("ostree="));
++        }
+     }
+ 
+-  return NULL;
++  /* Sealed UKI entries carry no options (the kernel command line is embedded
++   * in the UKI); the bootlink is recorded in a vendor key instead. */
++  return g_strdup (ostree_bootconfig_parser_get (config, "x-ostree-bootlink"));
+ }
+ 
+ /* From a BLS config, use its ostree= karg to find the deployment it points to and add it to
+-- 
+2.43.0
+
