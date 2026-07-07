@@ -29,6 +29,48 @@ OSTREE_BOOT_PARTITION ??= "/boot"
 OSTREE_KERNEL ??= "${KERNEL_IMAGETYPE}"
 OSTREE_KERNEL_ARGS_COMMON ??= "root=LABEL=otaroot rootfstype=ext4"
 OSTREE_KERNEL_ARGS ??= "${OSTREE_KERNEL_ARGS_COMMON}"
+
+# When "1", seal the kernel command line inside the UKI so the whole boot
+# artifact can be signed and verified by UEFI Secure Boot; the loader entry
+# then carries no options line. The ostree deployment is selected by the
+# fixed ostree=/ostree/root.BOOTID argument through a symlink ostree
+# maintains at deploy time (see the sealed UKI ostree patch). When "0",
+# kernel arguments stay in the loader entry, handled by ostree. Machine
+# classes using an EFI/UKI boot flow opt in (e.g. sota_qcom.bbclass).
+OSTREE_SEALED_UKI ??= "0"
+
+# The boot id is baked (signed) into the UKI command line as the
+# ostree=/ostree/root.BOOTID deployment selector, so it must be distinct for any
+# two deployments that could coexist on a device. It cannot be derived from the
+# boot artifact contents (the UKI cannot embed a hash of itself), and it must be
+# stable across the do_uki/do_image_ostree tasks. Tie it to the release-unique
+# BUILD_ID (in CI, the pipeline run id; locally, local-${DATETIME}): each OTA
+# release then gets a distinct UKI, so a rootfs-only update — where the UKI
+# inputs (kernel/initramfs/cmdline) are otherwise identical and would sstate-share
+# a boot id — still yields a distinct, individually selectable deployment.
+# Redeploying the byte-identical image (same BUILD_ID) is the only remaining
+# collision and is caught by the ostree publisher with a clear error.
+OSTREE_SEALED_BOOT_ID ?= "${BUILD_ID}"
+# BUILD_ID falls back to local-${DATETIME}, which would otherwise leak the wall-clock
+# time into do_uki's signature and make it non-deterministic. Exclude DATETIME from the
+# signature (as os-release.bb does for its own BUILD_ID use): the unexpanded value is
+# constant, so do_uki stays deterministic, while a changed release-unique BUILD_ID value
+# still retriggers it.
+BUILD_ID[vardepsexclude] = "DATETIME"
+
+# Only consumed on machines that enable the uki image class; for the
+# non-sealed SOTA UKI flow the command line must stay empty (ostree owns the
+# loader entry options).
+UKI_CMDLINE = "${@oe.utils.conditional('OSTREE_SEALED_UKI', '1', '${OSTREE_KERNEL_ARGS} ostree=/ostree/root.${OSTREE_SEALED_BOOT_ID}', '', d)}"
+
+# Ship the boot id next to the deployed UKI so image_types_ostree.bbclass
+# commits it into the tree as usr/lib/modules/KVER/ostree-boot-id.
+python do_uki:append() {
+    if d.getVar('OSTREE_SEALED_UKI') == '1':
+        path = os.path.join(d.getVar('DEPLOY_DIR_IMAGE'), d.getVar('UKI_FILENAME') + '.boot-id')
+        with open(path, 'w') as f:
+            f.write(d.getVar('OSTREE_SEALED_BOOT_ID') + '\n')
+}
 OSTREE_DEPLOY_DEVICETREE ??= "0"
 OSTREE_DEVICETREE ??= "${KERNEL_DEVICETREE}"
 OSTREE_MULTI_DEVICETREE_SUPPORT ??= "0"

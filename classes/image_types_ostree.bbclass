@@ -134,6 +134,12 @@ IMAGE_CMD:ostree () {
         # vmlinuz needs to exist for ostree to understand the deployment
         cp ${DEPLOY_DIR_IMAGE}/${UKI_FILENAME} usr/lib/modules/${kernelver}/vmlinuz
         ln usr/lib/modules/${kernelver}/vmlinuz usr/lib/modules/${kernelver}/uki.efi
+        if [ "${@oe.utils.conditional('OSTREE_SEALED_UKI', '1', '1', '0', d)}" = "1" ]; then
+            # boot id tying the deployment to the selector embedded in the
+            # UKI command line; makes ostree deploy the entry sealed
+            install -m 0644 ${DEPLOY_DIR_IMAGE}/${UKI_FILENAME}.boot-id \
+                usr/lib/modules/${kernelver}/ostree-boot-id
+        fi
     fi
 
     # Copy image manifest

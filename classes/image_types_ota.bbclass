@@ -50,10 +50,14 @@ IMAGE_CMD:ota () {
 	# Use OSTree hash to avoid any potential race conditions between
 	# multiple builds accessing the same ${OSTREE_REPO}.
 	ostree --repo=${OTA_SYSROOT}/ostree/repo pull-local --remote=${OSTREE_OSNAME} ${OSTREE_REPO} ${ostree_target_hash}
+	# With a sealed UKI the kernel command line is embedded in the UKI
+	# itself; ostree deploy keeps the loader entry free of options.
 	kargs_list=""
-	for arg in $(printf '%s' "${OSTREE_KERNEL_ARGS}"); do
-		kargs_list="${kargs_list} --karg-append=${arg}"
-	done
+	if [ "${@oe.utils.conditional('OSTREE_SEALED_UKI', '1', '1', '0', d)}" != "1" ]; then
+		for arg in $(printf '%s' "${OSTREE_KERNEL_ARGS}"); do
+			kargs_list="${kargs_list} --karg-append=${arg}"
+		done
+	fi
 
 	# Create the same reference on the device we use in the archive OSTree
 	# repo in ${OSTREE_REPO}. This reference will show up when showing the
