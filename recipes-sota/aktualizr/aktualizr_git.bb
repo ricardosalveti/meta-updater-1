@@ -21,6 +21,8 @@ GARAGE_SIGN_PV = "0.7.7"
 
 SRC_URI = " \
   gitsm://github.com/uptane/aktualizr;branch=${BRANCH};name=aktualizr;protocol=https \
+  file://0001-crypto-take-a-const-X509_NAME-from-X509_get_subject_.patch \
+  file://0002-Only-use-the-OpenSSL-ENGINE-API-when-built-with-PKCS.patch \
   file://10-resource-control.conf \
   file://aktualizr.service \
   file://aktualizr-secondary.service \

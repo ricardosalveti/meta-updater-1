@@ -1,0 +1,37 @@
+From 8d968146ad1dd79cb916b232726a0fc4309773fa Mon Sep 17 00:00:00 2001
+From: Daiane Angolini <daiane.angolini@oss.qualcomm.com>
+Date: Tue, 8 Sep 2026 17:05:47 -0300
+Subject: [PATCH 1/2] crypto: take a const X509_NAME from X509_get_subject_name
+
+OpenSSL 4.0 constified X509_get_subject_name(), so assigning its result
+to an X509_NAME * no longer compiles.
+
+The name is only read here, and X509_set_issuer_name() already accepts a
+const name, so a const local builds against both 3.x and 4.x.
+
+Assisted-by: Claude Code:claude-opus-5
+
+Signed-off-by: Daiane Angolini <daiane.angolini@oss.qualcomm.com>
+Upstream-Status: Submitted [https://github.com/uptane/aktualizr/pull/138]
+
+Signed-off-by: Ricardo Salveti <ricardo.salveti@oss.qualcomm.com>
+---
+ src/libaktualizr/crypto/crypto.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/libaktualizr/crypto/crypto.cc b/src/libaktualizr/crypto/crypto.cc
+index f254324d2..820fca975 100644
+--- a/src/libaktualizr/crypto/crypto.cc
++++ b/src/libaktualizr/crypto/crypto.cc
+@@ -622,7 +622,7 @@ void Crypto::signCert(const std::string &cacert_path, const std::string &capkey_
+   }
+ 
+   // set issuer name
+-  X509_NAME *ca_subj = X509_get_subject_name(ca_certificate.get());
++  const X509_NAME *ca_subj = X509_get_subject_name(ca_certificate.get());
+   if (ca_subj == nullptr) {
+     throw std::runtime_error(std::string("X509_get_subject_name failed: ") +
+                              ERR_error_string(ERR_get_error(), nullptr));
+-- 
+2.43.0
+

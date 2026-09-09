@@ -1,0 +1,57 @@
+From 409273dc71857d02983c2fe21994fe4ba7e57baa Mon Sep 17 00:00:00 2001
+From: Ricardo Salveti <ricardo.salveti@oss.qualcomm.com>
+Date: Wed, 9 Sep 2026 20:16:28 +0000
+Subject: [PATCH 2/2] Only use the OpenSSL ENGINE API when built with PKCS#11
+ support
+
+OpenSSL 4.0 removed the ENGINE implementation from libcrypto and only
+keeps the declarations in engine.h, so linking libaktualizr fails on
+the engine-backed key loading in Crypto::RSAPSSSign():
+
+  crypto.cc:149: undefined reference to 'ENGINE_load_private_key'
+
+That path can only be reached when aktualizr is built with BUILD_P11,
+since the P11 engine is the only source of a non-null engine. Compile
+it only in that case, so builds without PKCS#11 support link against
+OpenSSL 4.0 while nothing changes for builds with it or with OpenSSL
+3.x. A BUILD_P11 build against OpenSSL 4.0 now fails early with a
+clear compile-time error instead of an undefined reference at link
+time. Moving the PKCS#11 support itself to OpenSSL providers is a
+separate task.
+
+Upstream-Status: Submitted [https://github.com/uptane/aktualizr/pull/139]
+
+Signed-off-by: Ricardo Salveti <ricardo.salveti@oss.qualcomm.com>
+---
+ src/libaktualizr/crypto/crypto.cc | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/libaktualizr/crypto/crypto.cc b/src/libaktualizr/crypto/crypto.cc
+index 820fca975..2354ad2b2 100644
+--- a/src/libaktualizr/crypto/crypto.cc
++++ b/src/libaktualizr/crypto/crypto.cc
+@@ -145,6 +145,10 @@ std::string Crypto::RSAPSSSign(ENGINE *engine, const std::string &private_key, c
+   StructGuard<EVP_PKEY> key(nullptr, EVP_PKEY_free);
+   StructGuard<RSA> rsa(nullptr, RSA_free);
+   if (engine != nullptr) {
++#ifdef BUILD_P11
++#if OPENSSL_VERSION_MAJOR >= 4
++#error "PKCS#11 support uses the OpenSSL ENGINE API, which OpenSSL 4.0 removed; build without BUILD_P11"
++#endif
+     // TODO(OTA-2138): this call leaks memory somehow...
+     key.reset(ENGINE_load_private_key(engine, private_key.c_str(), nullptr, nullptr));
+ 
+@@ -158,6 +162,10 @@ std::string Crypto::RSAPSSSign(ENGINE *engine, const std::string &private_key, c
+       LOG_ERROR << "EVP_PKEY_get1_RSA failed with error " << ERR_error_string(ERR_get_error(), nullptr);
+       return std::string();
+     }
++#else
++    LOG_ERROR << "Built without PKCS#11 support, cannot load the private key from an engine";
++    return std::string();
++#endif
+   } else {
+     StructGuard<BIO> bio(BIO_new_mem_buf(const_cast<char *>(private_key.c_str()), static_cast<int>(private_key.size())),
+                          BIO_vfree);
+-- 
+2.43.0
+
