@@ -16,6 +16,9 @@ QCOM_ESP_IMAGE = ""
 QCOM_ESP_FILE = "${IMGDEPLOYDIR}/${IMAGE_LINK_NAME}.ota-esp"
 IMAGE_QCOMFLASH_FS_TYPE = "ota-ext4"
 
+# wic images use the qcomflash partition layout from meta-qcom
+WKS_FILE:sota ?= "qcom-flat.wks.in"
+
 EXTRA_IMAGECMD:ota-esp = "-s 1 -S ${QCOM_VFAT_SECTOR_SIZE}"
 
 UKI_IMAGE_CLASS = "uki"
